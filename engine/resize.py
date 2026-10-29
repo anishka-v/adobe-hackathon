@@ -1,75 +1,128 @@
 """
-THIS IS THE FILE YOU IMPLEMENT.
+CHAMELEON engine — `resize()` is the entry point `engine/main.py` calls.
 
-Everything else in this repo (input loading, output writing, rendering,
-the Dockerfile) is plumbing so you can focus on exactly one function:
-`resize()`. See RULES.md and the design schema for the full contract.
+Approach (see DESIGN.md):
+  1. parse the source into *units* (elements that travel together) and infer
+     each unit's role from geometry alone (units.py);
+  2. pick layout families from how much the aspect ratio changes and build
+     2–5 candidate layouts (layout.py);
+  3. repair each candidate against the hard invariants (validate.py);
+  4. score every candidate with an internal copy of the rubric (score.py) and
+     return the best.
+
+Nothing here touches pixels: assets are only moved and resized, text keeps
+its content and font family, and every element id is returned exactly once.
 """
 
-from typing import Any
+from __future__ import annotations
+
+import copy
+import math
+from typing import Any, Dict, List, Tuple
+
+from . import layout as L
+from .score import score as score_layout
+from .units import Unit, build_units
+from .validate import clamp_elements, fix_image_aspects, fix_text_boxes, repair
+
+NUMERIC = ("x", "y", "width", "height", "corner_radius", "stroke_width", "letter_spacing")
+
+
+def _candidates(r_src: float, r_tgt: float) -> List[Tuple[str, str, bool]]:
+    """(family, variant, dense) to try, from the aspect change Δ = ln(r_tgt / r_src)."""
+    delta = math.log(r_tgt / r_src)
+    cands: List[Tuple[str, str, bool]] = []
+    if r_tgt >= 4.5:
+        cands += [("ribbon", "logo_left", True), ("ribbon", "hero_left", True), ("wide", "hero_left", True)]
+    elif abs(delta) < 0.3:
+        cands += [("same_shape", "gaps", False), ("same_shape", "center", False)]
+        cands += [("tall", "order", False)] if r_tgt < 1.0 else [("wide", "hero_left", False)]
+    elif delta > 0:
+        cands += [("wide", "hero_left", False), ("wide", "hero_right", False), ("same_shape", "gaps", False)]
+        if r_tgt >= 2.5:
+            cands.append(("ribbon", "logo_left", False))
+    else:
+        cands += [("tall", "order", False), ("tall", "hero_first", False), ("same_shape", "gaps", False)]
+        if r_tgt < 0.4:
+            cands.append(("tall", "order", True))
+    # a plain column is a sane answer for any shape; let the scorer decide
+    if ("tall", "order", False) not in cands:
+        cands.append(("tall", "order", False))
+    return cands
+
+
+def _assemble(source: dict, units: List[Unit], W: int, H: int) -> Dict[str, Any]:
+    by_id = {e["id"]: e for u in units for e in u.elements}
+    src_by_id = {e["id"]: e for e in source["elements"]}
+    out_elements = []
+    for s in source["elements"]:
+        e = dict(s)
+        n = by_id.get(s["id"])
+        if n is not None:
+            for k in NUMERIC:
+                if k in n:
+                    e[k] = float(n[k])
+            if e["type"] == "text":
+                e["font_size"] = max(1, int(n.get("font_size", s.get("font_size", 12))))
+        out_elements.append(e)
+    fix_image_aspects(out_elements, src_by_id, W, H)
+    clamp_elements(out_elements, W, H)
+    fix_text_boxes(out_elements, W, H)
+    clamp_elements(out_elements, W, H)
+    for e in out_elements:
+        for k in NUMERIC:
+            if k in e and isinstance(e[k], float):
+                e[k] = round(e[k], 2)
+    return {"canvas": {"width": W, "height": H}, "elements": out_elements}
+
+
+def _fallback(source: dict, W: int, H: int) -> Dict[str, Any]:
+    """Uniform contain-scale, centred — only used if the layout path raises."""
+    w0, h0 = source["canvas"]["width"], source["canvas"]["height"]
+    s = min(W / w0, H / h0)
+    ox, oy = (W - w0 * s) / 2, (H - h0 * s) / 2
+    out = []
+    for e in source["elements"]:
+        e = dict(e)
+        full = e["width"] >= 0.9 * w0 and e["height"] >= 0.9 * h0
+        if full:
+            e.update({"x": 0.0, "y": 0.0, "width": float(W), "height": float(H)})
+        else:
+            e["x"], e["y"] = e["x"] * s + ox, e["y"] * s + oy
+            e["width"], e["height"] = e["width"] * s, e["height"] * s
+        if e["type"] == "text":
+            e["font_size"] = max(1, int(e["font_size"] * s))
+        out.append(e)
+    design = {"canvas": {"width": W, "height": H}, "elements": out}
+    clamp_elements(design["elements"], W, H)
+    return design
 
 
 def resize(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, Any]:
-    """
-    Args:
-        source: {"canvas": {"width": int, "height": int}, "elements": [...]}
-                 — the design at its original size. See
-                 chameleon_design_schema_v0.9.json for the full element spec
-                 (text / image / shape, position, size, rotation, opacity,
-                 z_index, group_id, and type-specific fields).
-        target_canvas: {"width": int, "height": int} — the shape you're
-                 resizing into.
+    W, H = int(target_canvas["width"]), int(target_canvas["height"])
+    try:
+        return _resize(source, W, H)
+    except Exception:  # never fail to produce an output
+        return _fallback(source, W, H)
 
-    Returns:
-        A design dict with the SAME shape as `source`:
-        {"canvas": target_canvas, "elements": [...]}
 
-        Hard requirements (see RULES.md for the full list):
-        - Every element `id` in `source` must appear exactly once in your
-          output. Do not add, remove, or invent elements.
-        - Do not regenerate or redraw any asset's pixel content — you are
-          repositioning and resizing the elements you were given, nothing
-          more. This is a disqualifying rule, not a style preference.
-        - Non-background image elements should be kept in proportion
-          (matching the source aspect ratio within ~5%) unless they are a
-          full-bleed / `fit: "cover"` element, which is expected to crop.
-        - `font_size` may change to help text fit. `font_family` and
-          `content` should not, for this stage of scoring (see RULES.md,
-          "Adaptive typography and copy").
-        - Nothing should end up outside `target_canvas`'s bounds.
-
-    This is where your actual approach goes: constraint solving, a learned
-    layout model, heuristics, whatever you choose. Latency is not a scoring
-    concern (see RULES.md) — spend your effort on quality, not speed.
-    """
-
-    # ------------------------------------------------------------------
-    # Naive baseline so this file runs out of the box. This is a uniform
-    # stretch — literally the thing the brief tells you NOT to do ("a
-    # naive program stretches the picture; a good one moves the
-    # furniture"). It's here so `python -m engine.main` produces valid,
-    # schema-correct output on day one. Replace the body of this function;
-    # do not just tune these three lines.
-    # ------------------------------------------------------------------
-    scale_x = target_canvas["width"] / source["canvas"]["width"]
-    scale_y = target_canvas["height"] / source["canvas"]["height"]
-
-    out_elements = []
-    for el in source["elements"]:
-        el = dict(el)  # shallow copy — don't mutate the input
-        el["x"] = el["x"] * scale_x
-        el["y"] = el["y"] * scale_y
-        el["width"] = el["width"] * scale_x
-        el["height"] = el["height"] * scale_y
-        if el["type"] == "text":
-            # font_size scaling isn't required to be uniform — this is
-            # just a starting point. Floored at 1px: the schema requires
-            # font_size >= 1, and an extreme downscale (e.g. a tall poster
-            # squeezed into a short banner) can otherwise compute < 1.
-            el["font_size"] = max(1.0, el["font_size"] * min(scale_x, scale_y))
-        out_elements.append(el)
-
-    return {
-        "canvas": {"width": target_canvas["width"], "height": target_canvas["height"]},
-        "elements": out_elements,
-    }
+def _resize(source: dict, W: int, H: int) -> Dict[str, Any]:
+    w0, h0 = float(source["canvas"]["width"]), float(source["canvas"]["height"])
+    base_units = build_units(source)
+    r_src, r_tgt = w0 / h0, W / H
+    best: Tuple[float, List[Unit]] | None = None
+    for family, variant, dense in _candidates(r_src, r_tgt):
+        units = copy.deepcopy(base_units)
+        ctx = L.Ctx.make(W, H, w0, h0, units, ribbon=(family == "ribbon"), dense=dense)
+        try:
+            L.FAMILIES[family](units, ctx, variant)
+            axis = "x" if family == "ribbon" else "y"
+            collisions = repair(units, W, H, axis=axis)
+            sc = score_layout(units, ctx, collisions)
+        except Exception:
+            continue
+        if best is None or sc > best[0]:
+            best = (sc, units)
+    if best is None:
+        return _fallback(source, W, H)
+    return _assemble(source, best[1], W, H)
