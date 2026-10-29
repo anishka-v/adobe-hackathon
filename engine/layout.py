@@ -259,6 +259,24 @@ def _text_width_for(u: Unit, region_w: float, ctx: Ctx) -> float:
 # Column packer
 # ---------------------------------------------------------------------------
 
+def _place_by_source_x(band: List[Unit], rx: float, rw: float, gap: float, ctx: Ctx) -> List[float]:
+    """Left edges for a row's members that keep their source x-centres (scaled to
+    the region), separated by at least `gap` and kept inside the region. Only
+    called when the members fit across, so a solution always exists."""
+    widths = [u.box[2] for u in band]
+    xs = [rx + ((u.src_box[0] + u.src_box[2] / 2) / ctx.w0) * rw - w / 2 for u, w in zip(band, widths)]
+    order = sorted(range(len(band)), key=lambda i: xs[i])
+    right = rx - gap
+    for i in order:  # left to right: no overlaps, nothing past the left edge
+        xs[i] = max(xs[i], right + gap)
+        right = xs[i] + widths[i]
+    left = rx + rw + gap
+    for i in reversed(order):  # right to left: nothing past the right edge
+        xs[i] = min(xs[i], left - gap - widths[i])
+        left = xs[i]
+    return xs
+
+
 def pack_column(units: List[Unit], region: Box, ctx: Ctx, sizer: Sizer, align: Optional[str] = None,
                 hero_cap: float = 0.45, spread: bool = True, allow_split: bool = True) -> float:
     """Stack `units` vertically inside `region`. Returns the total content height.
@@ -451,12 +469,17 @@ def pack_column(units: List[Unit], region: Box, ctx: Ctx, sizer: Sizer, align: O
         lone_from_row = len(band) == 1 and len(band_of[id(band[0])]) > 1
         a = align or (band[0].align if len(band) == 1 and not lone_from_row else "center")
         if len(band) > 1:
-            # a row that was spread across the source stays spread; a clustered one stays clustered
+            # a row that was spread across the source keeps each member at its own
+            # relative position (logo centred, ribbon in the corner); a clustered
+            # row stays clustered
             src_span = max(u.src_box[0] + u.src_box[2] for u in band) - min(u.src_box[0] for u in band)
-            spread_row = src_span > 0.6 * ctx.w0 and tot_w < rw
-            row_gap = (rw - sum(u.box[2] for u in band)) / (len(band) - 1) if spread_row else gap
-            row_gap = min(row_gap, 4 * gap)
-            tot_w = sum(u.box[2] for u in band) + row_gap * (len(band) - 1)
+            if src_span > 0.6 * ctx.w0 and tot_w <= rw:
+                xs = _place_by_source_x(band, rx, rw, gap, ctx)
+                for u, x in zip(band, xs):
+                    u.move_to(x, y + (h - u.box[3]) / 2)
+                y += h + gap + extra_gap
+                continue
+            row_gap = gap
         else:
             row_gap = gap
         if a == "left":

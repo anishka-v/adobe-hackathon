@@ -30,6 +30,7 @@ CATALOGUE = [
     ("Half Page", 300, 600), ("Twitter Header", 1500, 500), ("YouTube Banner", 2560, 1440),
     ("Square Small", 200, 200), ("FB Cover New", 1640, 624), ("Email Header", 600, 200),
     ("Presentation", 1920, 1080),
+    ("Wide Banner", 1600, 400),  # the Level 2 sample's own target
 ]
 TILE = 360
 OUT = Path("output/matrix")
