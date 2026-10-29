@@ -30,65 +30,60 @@ design takes a few seconds.
 
 ## Approach
 
-Deterministic relayout, in six steps:
+The engine never stretches a design. It takes the design apart into its
+pieces, works out what each piece is for, and arranges those same pieces
+again on the new canvas — the way a designer moves furniture into a room of a
+different shape. Only positions, sizes and font sizes change.
 
-1. **Units.** Elements that travel together become one unit: a `group_id`
-   (a button's pill + label, a rotated ribbon), or a text sitting on its own
-   panel.
-2. **Roles from geometry alone.** No ids are trusted. Full-bleed → background;
-   small, wide, top-anchored image → logo; largest image → hero; texts ranked
-   by font size → headline / subhead / body / legal; largest low pill → CTA,
-   other pills → badges; translucent or bleeding shapes → decoration.
-3. **Layout families**, chosen by how far the aspect ratio moves:
-   *same-shape* (uniform scale, leftover goes into the gaps), *tall* (one
-   column; the logo stays pinned to the top), *wide* (hero on one side, text
-   column on the other), *ribbon* (one row: logo │ hero │ text │ badges │ CTA,
-   legal as a strip). Several candidates are built per task.
-4. **Fitting.** Text is measured with the renderer's own fonts and wrap code,
-   so what fits here fits in the PNG. When space runs out, the least important
-   units shrink first — never below brand/readability floors — then rows wrap,
-   columns split, and finally fonts are squeezed least-important-first. The
-   headline gives way last. When most of a canvas would be empty, everything
-   grows a little instead.
-5. **Repair.** Clamp to canvas, resolve collisions between solid units
-   (overlaps that existed in the source are intentional and left alone), keep
-   every non-cover image at its source aspect.
-6. **Score and pick.** Each candidate is scored against an internal copy of
-   the rubric: collisions, floor breaches (weighted by priority), readability,
-   hierarchy, balance, use of space, faithfulness to the source. Best wins.
+**1. Group the pieces.** Some elements only make sense together: a button is
+a pill shape plus its label, a ribbon is a rotated box plus its text. Elements
+that share a `group_id`, or a text sitting on its own panel, are treated as
+one piece from here on.
 
-Decisions worth knowing:
+**2. Work out what each piece is.** The input carries no labels — only ids,
+types and geometry — so roles come from shape and position:
 
-- **Priority ladder:** headline > CTA > logo > hero > subhead > badges > body >
-  legal > decoration > minor image. It governs who shrinks first, who gives up
-  width in a ribbon, and who is placed first.
-- **Floors on visible pixels.** The brand logo is 60 % transparent padding, so
-  the engine reads each asset's alpha bounds once (`engine/assets.py`) and
-  sizes the logo and hero by what a viewer sees. Floors never exceed what the
-  source itself showed at the target's scale, so a deliberately small logo
-  stays small.
-- **Two-tier contract.** On canvases of 60 000 px² and up every floor holds
-  (logo and hero visibly sized, headline ≥ 10 px, other text ≥ 6 px). Below
-  that — 17 elements on a 320×50 mobile banner — nothing drops under 4 px and
-  the headline stays the largest text.
-- **Source rows stay rows.** Elements that sat side by side keep their relative
-  positions; a row that no longer fits wraps rather than shrinks.
+| What the engine sees | What it concludes |
+|---|---|
+| an image covering the canvas | background |
+| a small, wide image near the top edge | logo |
+| the biggest remaining image | product |
+| the largest text | headline; the next largest is the subhead |
+| long, small text near the bottom | legal copy |
+| the biggest button low on the canvas | call to action; other buttons are badges |
+| a translucent or edge-bleeding shape | decoration |
 
-What never changes: element ids and count, `content`, `font_family`, colours,
-`asset_id`, `opacity`, `z_index`, `style_runs`, and the pixel content of every
-asset. The engine only ever repositions and resizes.
+Each role has a priority — headline, then call to action, logo, product,
+subhead, badges, body text, legal, decoration — which decides what gives way
+first when space is short.
 
-## Guarantees
+**3. Choose a layout for the new shape.** Comparing the old and new aspect
+ratios, the engine builds two to five candidate layouts:
 
-The engine enforces these on every output before returning it:
+- *nearly the same shape* — keep the design as it is, scale it, and put the
+  extra room into the spacing between pieces;
+- *taller* — one column in reading order, with the logo kept at the top;
+- *wider* — product on one side, a column of text and buttons on the other;
+- *a banner* (five or more times wider than tall) — a single row: logo,
+  product, text, badges, button, with the legal copy as a thin strip along the
+  bottom.
 
-- same ids, nothing off-canvas (rotated bounds included), non-cover images
-  within 0.5 % of their source aspect, protected fields untouched;
-- every text box is wide and tall enough for its wrapped text at the returned
-  integer font size, judged on the exact values the renderer receives;
-- deterministic: the same input always yields the same output;
-- `resize()` never raises — if the layout path fails it logs the traceback to
-  stderr and writes a clamped uniform scale instead.
+**4. Make everything fit.** Text is measured with the same fonts and
+line-wrapping code the official renderer uses, so a text box that fits here
+fits in the picture. When a layout is too crowded, the least important pieces
+shrink first, and never below a readable size; then rows wrap, then a column
+splits in two, and only as a last resort are fonts squeezed — the headline
+last. When a layout would leave most of the canvas empty, everything grows a
+little instead.
+
+**5. Tidy up.** Every piece is kept inside the canvas, pieces that collide are
+pushed apart (overlaps that were in the original are deliberate and left
+alone), and every image keeps its proportions.
+
+**6. Pick the best candidate.** Each candidate is scored on what the brief's
+rubric asks for — no collisions, readable text, the brand intact, an even and
+balanced arrangement, and faithfulness to the original — and the best one is
+returned.
 
 ## How to test
 
@@ -152,12 +147,3 @@ engine/
 
 The starter kit's rules and FAQ are in [RULES.md](RULES.md) and
 [FAQ.md](FAQ.md); the schema is `chameleon_design_schema_v0.9.json`.
-
-## Known limits
-
-- Extreme banners with long copy (Level 3 at 728×90) are dense: a 13–15 px
-  three-line headline over 6–8 px badges is about what 90 px of height allows
-  without dropping elements, which stage one forbids.
-- Decorative shapes that bled off the source canvas are pulled inside it, since
-  the structural check is literal about off-canvas elements.
-- Nothing is rewritten, re-fonted or dropped. Those are finale features.
