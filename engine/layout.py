@@ -16,7 +16,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import textfit
 from .geometry import Box, union
-from .quality import MIN_HEADLINE_PX, MIN_TEXT_PX, scale_within_floors, unit_ok
+from .quality import (HARD_MIN_PX, MIN_HEADLINE_PX, MIN_TEXT_PX, hard_shrink_factor, image_floor,
+                      image_visible_dims, scale_within_floors, unit_ok)
 from .units import Unit, floors_for, text_role_of
 
 
@@ -108,9 +109,6 @@ def size_pill(u: Unit, scale: float, max_w: float, ctx: Ctx) -> None:
     """Scale shape + label rigidly, then make sure the label fits on one line."""
     shp, lbl = u.shape_el, u.text_el
     assert shp is not None and lbl is not None
-    src = copy.deepcopy(u.elements)
-    for e in u.elements:
-        e.update(copy.deepcopy(next(s for s in src if s["id"] == e["id"])))
     u.scale(scale)
     _reset_origin(u)
     role_floor = floors_for("label", ctx.W, ctx.H, ctx.ribbon)
@@ -128,8 +126,10 @@ def size_pill(u: Unit, scale: float, max_w: float, ctx: Ctx) -> None:
         if want <= max_w:
             shp["width"] = want
         else:
+            # the column is narrower than the label: shrink to legibility, no further
+            # (a 4 px label that overhangs its pill beats a 1 px one that doesn't)
             shp["width"] = max_w
-            while nat > shp["width"] - 2 * pad and fs > 1:
+            while nat > shp["width"] - 2 * pad and fs > HARD_MIN_PX:
                 fs -= 1
                 nat = textfit.natural_width(lbl, fs)
     # keep pill height proportional to the label
@@ -162,9 +162,9 @@ def size_image(u: Unit, scale: float, max_w: float, max_h: float, ctx: Ctx) -> N
     img["x"], img["y"] = 0.0, 0.0
 
 
-def size_generic(u: Unit, scale: float, max_w: float, max_h: float, ctx: Ctx, src: List[dict]) -> None:
+def size_generic(u: Unit, scale: float, max_w: float, max_h: float, ctx: Ctx, src: Dict[str, dict]) -> None:
     for e in u.elements:
-        e.update(copy.deepcopy(next(s for s in src if s["id"] == e["id"])))
+        e.update(src[e["id"]])
     _reset_origin(u)
     u.scale(scale)
     u.scale_to_fit(max_w, max_h)
@@ -173,11 +173,10 @@ def size_generic(u: Unit, scale: float, max_w: float, max_h: float, ctx: Ctx, sr
 
 def _lift_logo(u: Unit, region_w: float, region_h: float, ctx: Ctx) -> None:
     """A logo capped below its visible minimum is scaled back up, if the region allows."""
-    from .quality import logo_min_side
     _, _, w, h = u.box
-    side = min(w, h)
-    need = logo_min_side(ctx.W, ctx.H)
-    if 0 < side < need:
+    side = min(image_visible_dims(u))
+    need = image_floor(u, ctx.W, ctx.H)
+    if 0 < side < need and w > 0 and h > 0:
         f = min(need / side, region_w / w, region_h / h)
         if f > 1.0:
             u.scale(f)
@@ -188,11 +187,15 @@ class Sizer:
 
     def __init__(self, units: Sequence[Unit], ctx: Ctx):
         self.ctx = ctx
-        self.pristine = {id(u): copy.deepcopy(u.elements) for u in units}
+        # shallow copies are enough: we only ever overwrite scalar fields
+        self.pristine: Dict[int, Dict[str, dict]] = {
+            id(u): {e["id"]: dict(e) for e in u.elements} for u in units
+        }
 
     def restore(self, u: Unit) -> None:
+        saved = self.pristine[id(u)]
         for e in u.elements:
-            e.update(copy.deepcopy(next(s for s in self.pristine[id(u)] if s["id"] == e["id"])))
+            e.update(saved[e["id"]])
 
     def size(self, u: Unit, scale: float, region_w: float, region_h: float, shrink: float = 1.0,
              text_width: Optional[float] = None, hero_cap_h: Optional[float] = None) -> None:
@@ -260,29 +263,34 @@ def pack_column(units: List[Unit], region: Box, ctx: Ctx, sizer: Sizer, align: O
                 hero_cap: float = 0.45, spread: bool = True, allow_split: bool = True) -> float:
     """Stack `units` vertically inside `region`. Returns the total content height.
 
-    If the stack cannot fit even with every unit at its floor, the bands are
-    split across 2-3 side-by-side columns before fonts are squeezed further."""
+    When the stack does not fit: shrink the least important units first (never
+    below a brand/readability floor), then tighten gaps, then split into 2-3
+    side-by-side columns, then take height from text least-important first —
+    the headline gives way last. When most of the region would be left empty,
+    everything grows a little instead."""
     rx, ry, rw, rh = region
     if not units:
         return 0.0
-    shrink: Dict[int, float] = {id(u): 1.0 for u in units}
     gap = ctx.gap
-
+    shrink: Dict[int, float] = {id(u): 1.0 for u in units}
+    grow = 1.0
     src_bands = bands_by_source_row(units)
+    band_of = {id(u): b for b in src_bands for u in b}
+    by_priority_desc = sorted(units, key=lambda u: -u.priority)  # headline first: hierarchy guard
 
-    def size_all() -> Tuple[List[List[Unit]], List[float], float]:
-        # headline first so the hierarchy guard has a reference
-        for u in sorted(units, key=lambda u: -u.priority):
-            n_in_band = min(3, len(next(b for b in src_bands if u in b)))
-            w_avail = rw if n_in_band == 1 else (rw - gap * (n_in_band - 1)) / n_in_band
-            if u.is_pill or u.kind == "logo":
-                # these only ever scale down to fit, so give them the whole column and
-                # let the row wrap below, rather than shrinking labels to fit a slice
-                w_avail = rw
-            tw = _text_width_for(u, rw, ctx) if (u.is_text and n_in_band == 1) else w_avail
-            sizer.size(u, ctx.s_pref, w_avail, rh, shrink[id(u)], text_width=tw, hero_cap_h=hero_cap * rh)
-        # a source row that no longer fits across wraps into several rows
-        # (a modest shrink first, so pairs like "two badges" stay side by side)
+    def size_unit(u: Unit) -> None:
+        n_in_band = min(3, len(band_of[id(u)]))
+        w_avail = rw if n_in_band == 1 else (rw - gap * (n_in_band - 1)) / n_in_band
+        if u.is_pill or u.kind == "logo":
+            # these only ever scale down to fit, so give them the whole column and
+            # let the row wrap below, rather than shrinking labels to fit a slice
+            w_avail = rw
+        tw = _text_width_for(u, rw, ctx) if (u.is_text and n_in_band == 1) else w_avail
+        sizer.size(u, ctx.s_pref * grow, w_avail, rh, shrink[id(u)], text_width=tw, hero_cap_h=hero_cap * rh)
+
+    def wrap_rows() -> Tuple[List[List[Unit]], List[float], float]:
+        """A source row that no longer fits across wraps into several rows
+        (a modest shrink first, so pairs like "two badges" stay side by side)."""
         wrapped: List[List[Unit]] = []
         for band in src_bands:
             tot_w = sum(u.box[2] for u in band) + gap * (len(band) - 1)
@@ -290,9 +298,10 @@ def pack_column(units: List[Unit], region: Box, ctx: Ctx, sizer: Sizer, align: O
                 f = (rw - gap * (len(band) - 1)) / max(1.0, tot_w - gap * (len(band) - 1))
                 if f >= 0.7:
                     for u in band:
-                        u.scale(f)
-                    wrapped.append(band)
-                    continue
+                        scale_within_floors(u, f, ctx.W, ctx.H)
+                    if sum(u.box[2] for u in band) + gap * (len(band) - 1) <= rw + 0.5:
+                        wrapped.append(band)
+                        continue  # else a floor held a member up: wrap below instead
                 row: List[Unit] = []
                 row_w = 0.0
                 for u in band:
@@ -307,29 +316,43 @@ def pack_column(units: List[Unit], region: Box, ctx: Ctx, sizer: Sizer, align: O
             else:
                 wrapped.append(band)
         heights = [max(u.box[3] for u in band) for band in wrapped]
-        total = sum(heights) + gap * (len(wrapped) - 1)
-        return wrapped, heights, total
+        return wrapped, heights, sum(heights) + gap * (len(wrapped) - 1)
+
+    def size_all(_u: Optional[Unit] = None) -> Tuple[List[List[Unit]], List[float], float]:
+        for u in by_priority_desc:
+            size_unit(u)
+        return wrap_rows()
+
+    def size_one(u: Unit) -> Tuple[List[List[Unit]], List[float], float]:
+        # only this unit's source row needs re-sizing (the others are unchanged)
+        for v in band_of[id(u)]:
+            size_unit(v)
+        return wrap_rows()
 
     bands, heights, total = size_all()
 
-    # shrink least-important first until it fits
-    order = sorted(units, key=lambda u: u.priority)
-    for u in order:
+    # 1. shrink least-important first, stopping at the brand/readability floors
+    for u in sorted(units, key=lambda u: u.priority):
         if total <= rh:
             break
         floor_scale = (0.6 if u.kind == "headline" else 0.3) if u.is_text else u.min_scale
+        resize = size_all if u.kind == "headline" else size_one  # others depend on the headline's size
         while total > rh and shrink[id(u)] > floor_scale + 1e-6:
             prev = shrink[id(u)]
             shrink[id(u)] = max(floor_scale, prev * 0.85)
-            bands, heights, total = size_all()
+            bands, heights, total = resize(u)
             if not unit_ok(u, ctx.W, ctx.H):
                 # that step broke a brand/readability floor: undo it, move on
                 shrink[id(u)] = prev
-                bands, heights, total = size_all()
+                bands, heights, total = resize(u)
                 break
+
+    # 2. tighter gaps
     if total > rh:
         gap = max(2.0, gap * 0.4)
-        bands, heights, total = size_all()
+        bands, heights, total = wrap_rows()
+
+    # 3. side-by-side columns
     if total > rh and allow_split and len(bands) >= 2 and rw >= 2.2 * ctx.margin * 4:
         k = min(3, max(2, int(math.ceil(total / rh))))
         k = min(k, len(bands))
@@ -346,35 +369,60 @@ def pack_column(units: List[Unit], region: Box, ctx: Ctx, sizer: Sizer, align: O
         col_w = (rw - gap * (k - 1)) / k
         hs = []
         for i, g in enumerate(groups):
+            # side-by-side columns share a top edge (each centred on its own looks accidental)
             hs.append(pack_column(g, (rx + i * (col_w + gap), ry, col_w, rh), ctx, sizer,
-                                  align=align, hero_cap=hero_cap, spread=spread, allow_split=False))
+                                  align=align, hero_cap=hero_cap, spread=False, allow_split=False))
         return max(hs)
-    if total > rh and total > 0:  # last resort: squeeze fonts (text) / boxes (others)
+
+    # 4. last resort: non-text shrinks within its floors; then text gives up height
+    #    least-important first - down to its floor, then (if it still doesn't fit)
+    #    below the floor to the hard minimum, in the same order. Headline last.
+    if total > rh and total > 0:
         f = max(0.3, (rh - gap * (len(bands) - 1)) / max(1.0, total - gap * (len(bands) - 1)))
         for u in units:
             if not u.is_text:
                 scale_within_floors(u, f, ctx.W, ctx.H)
-        # Text gets an exact budget: whatever height the non-text bands leave, shared in
-        # proportion to current heights. Fitted text is often shorter than its budget, so
-        # iterate; no clamp, so a large overflow is squeezed as hard as a small one.
-        texts = [u for u in units if u.is_text]
-        for _ in range(4):
-            heights = [max(u.box[3] for u in band) for band in bands]
-            total = sum(heights) + gap * (len(bands) - 1)
-            if total <= rh + 0.5 or not texts:
+        bands, heights, total = wrap_rows()
+        by_priority = sorted(units, key=lambda u: u.priority)
+        for hard in (False, True):
+            for u in by_priority:
+                need = total - rh
+                if need <= 0.5:
+                    break
+                if u.is_text:
+                    t = u.text_el
+                    lo = HARD_MIN_PX if hard else (MIN_HEADLINE_PX if u.kind == "headline" else MIN_TEXT_PX)
+                    cur = int(t["font_size"])
+                    if cur <= lo:
+                        continue
+                    fs, m = textfit.fit_font_size(t, t["width"], max(1.0, u.box[3] - need), cur, lo)
+                    t["font_size"] = int(fs)
+                    t["height"] = m.height + 0.1 * fs
+                elif hard:
+                    # pills and images only give way in the hard pass, and never below legibility
+                    h = u.box[3]
+                    f = hard_shrink_factor(u, max(0.25, (h - need) / h) if h > 0 else 1.0)
+                    if f < 1.0:
+                        u.scale(f)
+                else:
+                    continue
+                bands, heights, total = wrap_rows()
+            if total - rh <= 0.5:
                 break
-            text_h = sum(h for band, h in zip(bands, heights) if any(u.is_text for u in band))
-            other_h = total - text_h
-            ft = max(0.05, (rh - other_h) / max(1.0, text_h))
-            for u in texts:
-                t = u.text_el
-                lo = MIN_HEADLINE_PX if u.kind == "headline" else MIN_TEXT_PX
-                fs, m = textfit.fit_font_size(t, t["width"], max(1.0, u.box[3] * ft),
-                                              int(t["font_size"]), min(lo, int(t["font_size"])))
-                t["font_size"] = int(fs)
-                t["height"] = m.height + 0.1 * fs
-        heights = [max(u.box[3] for u in band) for band in bands]
-        total = sum(heights) + gap * (len(bands) - 1)
+
+    # 5. sparse: grow everything a little rather than leave most of the region empty
+    if spread and total < 0.6 * rh and all(v >= 1.0 - 1e-9 for v in shrink.values()):
+        fails0 = sum(not unit_ok(u, ctx.W, ctx.H) for u in units)
+        best = 1.0
+        for g in (1.12, 1.25, 1.4):
+            grow = g
+            cand = size_all()
+            if cand[2] > 0.85 * rh or sum(not unit_ok(u, ctx.W, ctx.H) for u in units) > fails0:
+                break
+            best = g
+        if grow != best:
+            grow = best
+        bands, heights, total = size_all()
 
     # leftover: grow the hero a little, then spread gaps, then centre
     leftover = rh - total
@@ -400,7 +448,7 @@ def pack_column(units: List[Unit], region: Box, ctx: Ctx, sizer: Sizer, align: O
         tot_w = sum(u.box[2] for u in band) + gap * (len(band) - 1)
         # a unit alone on its row keeps its source alignment, unless it was split out of a
         # shared source row (wrapped badges), where its old left/right slot means nothing
-        lone_from_row = len(band) == 1 and len(next(b for b in src_bands if band[0] in b)) > 1
+        lone_from_row = len(band) == 1 and len(band_of[id(band[0])]) > 1
         a = align or (band[0].align if len(band) == 1 and not lone_from_row else "center")
         if len(band) > 1:
             # a row that was spread across the source stays spread; a clustered one stays clustered
@@ -501,11 +549,11 @@ def pack_row(items: List[List[Unit]], region: Box, ctx: Ctx, sizer: Sizer) -> No
         fixed_w = sum(max(u.box[2] for u in col) for col in fixed_cols)
         avail = rw - fixed_w - gap * (n_cols - 1)
     # text columns share the leftover width, proportional to their max source width
-    if text_cols:
+    def pack_text_cols(avail_w: float) -> None:
         weights = [max(u.src_box[2] for u in col) for col in text_cols]
         tw_sum = sum(weights) or 1.0
         for col, wgt in zip(text_cols, weights):
-            col_w = max(1.0, avail * wgt / tw_sum)
+            col_w = max(1.0, avail_w * wgt / tw_sum)
             # stack text inside the column; floors handled by pack_column. No column
             # split here: the row already budgeted exactly one column of this width.
             pack_column(col, (0.0, 0.0, col_w, rh), ctx, sizer, align="left", spread=False,
@@ -515,6 +563,29 @@ def pack_row(items: List[List[Unit]], region: Box, ctx: Ctx, sizer: Sizer) -> No
             dy = (rh - cb[3]) / 2 - cb[1]
             for u in col:
                 u.translate(0, dy)
+
+    if text_cols:
+        pack_text_cols(avail)
+        # Priority: a headline below its floor outranks badges, the hero and minor images
+        # sitting at theirs. Take width from those (logo and CTA last) and re-pack.
+        head = next((u for col in text_cols for u in col if u.kind == "headline"), None)
+        for _ in range(4):
+            if head is None or int(head.text_el["font_size"]) >= MIN_HEADLINE_PX:
+                break
+            victims = [u for col in fixed_cols for u in col if u.kind not in ("logo", "cta")]
+            if not victims:
+                victims = [u for col in fixed_cols for u in col]
+            changed = False
+            for u in victims:
+                f = hard_shrink_factor(u, 0.75)
+                if f < 1.0:
+                    u.scale(f)
+                    changed = True
+            if not changed:
+                break
+            fixed_w = sum(max(u.box[2] for u in col) for col in fixed_cols)
+            avail = rw - fixed_w - gap * (n_cols - 1)
+            pack_text_cols(avail)
 
     # place columns left to right; leftover spread into the gaps
     widths = [union(u.box for u in col)[2] for col in items]
@@ -810,6 +881,31 @@ def family_ribbon(units: List[Unit], ctx: Ctx, variant: str = "logo_left") -> No
     cols = [c for c in cols if c]
     pack_row(cols, region, ctx, sizer)
     _clamp_all(solid, ctx)
+
+
+def enforce_hierarchy(units: List[Unit]) -> None:
+    """No text may end up larger than the headline (the source's largest text).
+    Boxes keep their width; heights follow the re-measured text."""
+    head = next((u for u in units if u.kind == "headline"), None)
+    if head is None or head.text_el is None:
+        return
+    hf = int(head.text_el["font_size"])
+    for u in units:
+        if u is head:
+            continue
+        for t in u.elements:
+            if t["type"] != "text" or int(t["font_size"]) <= hf:
+                continue
+            t["font_size"] = hf
+            m = textfit.measure(t, hf, max(1.0, t["width"]))
+            if u.is_pill:
+                # keep the label centred in its pill
+                shp = u.shape_el
+                t["height"] = hf * float(t.get("line_height", 1.2) or 1.2)
+                if shp is not None:
+                    t["y"] = shp["y"] + (shp["height"] - t["height"]) / 2
+            else:
+                t["height"] = m.height + 0.1 * hf
 
 
 FAMILIES = {

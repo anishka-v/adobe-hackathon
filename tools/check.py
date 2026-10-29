@@ -17,7 +17,7 @@ import platform
 import sys
 from pathlib import Path
 
-from engine.quality import design_issues
+from engine.quality import design_issues, tiny_issues
 from engine.resize import _resize
 from engine.units import build_units
 from engine.validate import check_design
@@ -36,7 +36,9 @@ def main() -> int:
         for name, w, h in CATALOGUE:
             cells += 1
             out = _resize(source, w, h)
-            problems = check_design(source, out) + design_issues(units, out)
+            problems = check_design(source, out) + tiny_issues(units, out)
+            if w * h >= 60_000:  # same tier rule as tests/test_invariants.py
+                problems += design_issues(units, out)
             if problems:
                 bad += 1
                 print(f"FAIL {path.stem} {name} {w}x{h}: {problems}")

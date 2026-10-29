@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import copy
 import math
+import sys
+import traceback
 from typing import Any, Dict, List, Tuple
 
 from . import layout as L
@@ -73,6 +75,8 @@ def _assemble(source: dict, units: List[Unit], W: int, H: int) -> Dict[str, Any]
         for k in NUMERIC:
             if k in e and isinstance(e[k], float):
                 e[k] = round(e[k], 2)
+    # last: fonts only, judged on the rounded values the renderer will actually get
+    fix_text_boxes(out_elements, W, H, grow=False)
     return {"canvas": {"width": W, "height": H}, "elements": out_elements}
 
 
@@ -102,7 +106,9 @@ def resize(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, A
     W, H = int(target_canvas["width"]), int(target_canvas["height"])
     try:
         return _resize(source, W, H)
-    except Exception:  # never fail to produce an output
+    except Exception:  # never fail to produce an output, but say so in the log
+        print("[chameleon] layout failed, writing the uniform fallback:\n" + traceback.format_exc(),
+              file=sys.stderr)
         return _fallback(source, W, H)
 
 
@@ -116,10 +122,12 @@ def _resize(source: dict, W: int, H: int) -> Dict[str, Any]:
         ctx = L.Ctx.make(W, H, w0, h0, units, ribbon=(family == "ribbon"), dense=dense)
         try:
             L.FAMILIES[family](units, ctx, variant)
+            L.enforce_hierarchy(units)
             axis = "x" if family == "ribbon" else "y"
             collisions = repair(units, W, H, axis=axis)
             sc = score_layout(units, ctx, collisions)
-        except Exception:
+        except Exception as e:
+            print(f"[chameleon] candidate {family}/{variant} failed: {type(e).__name__}: {e}", file=sys.stderr)
             continue
         if best is None or sc > best[0]:
             best = (sc, units)

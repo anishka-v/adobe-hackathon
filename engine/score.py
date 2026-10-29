@@ -12,7 +12,7 @@ from typing import List
 
 from .geometry import area, overlap_area, union
 from .layout import Ctx
-from .quality import unit_issues
+from .quality import unit_penalty
 from .units import Unit, text_role_of
 
 
@@ -44,8 +44,9 @@ def score(units: List[Unit], ctx: Ctx, collisions: int, explain: dict | None = N
     # collisions between solid units are the cardinal sin
     s -= 40.0 * collisions
     take("collisions")
-    # an invisible logo or unreadable text is as bad as a collision
-    s -= 40.0 * len(unit_issues(units, W, H))
+    # an invisible logo or unreadable headline is as bad as a collision; a slightly
+    # small badge label is not (weighted by priority and how far below the floor)
+    s -= 40.0 * unit_penalty(units, W, H)
     take("brand_floors")
     # text over the hero image box
     hero = next((u for u in solid if u.kind == "hero"), None)

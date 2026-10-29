@@ -11,16 +11,25 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
+from engine.quality import design_issues, tiny_issues
 from engine.resize import resize
+from engine.units import build_units
 from engine.validate import check_design
 from renderer.converter.convert import render_design_to_png
 
+# Real platform formats, the way the brief says hidden targets are drawn. The
+# first block is the common social/print set; the second adds the harsh IAB
+# display sizes and a few wide web formats.
 CATALOGUE = [
     ("IG Post", 1080, 1080), ("IG Portrait", 1080, 1350), ("IG Story", 1080, 1920),
     ("Pinterest", 1000, 1500), ("YouTube Thumb", 1280, 720), ("Twitter", 1600, 900),
     ("FB Cover", 820, 312), ("LinkedIn Banner", 1584, 396), ("Leaderboard", 728, 90),
     ("Large Leaderboard", 970, 90), ("Billboard", 970, 250), ("Medium Rect", 300, 250),
     ("Skyscraper", 160, 600), ("A4 Poster", 2480, 3508),
+    ("Mobile Banner", 320, 50), ("Mobile Large", 320, 100), ("Full Banner", 468, 60),
+    ("Half Page", 300, 600), ("Twitter Header", 1500, 500), ("YouTube Banner", 2560, 1440),
+    ("Square Small", 200, 200), ("FB Cover New", 1640, 624), ("Email Header", 600, 200),
+    ("Presentation", 1920, 1080),
 ]
 TILE = 360
 OUT = Path("output/matrix")
@@ -34,12 +43,14 @@ def main() -> int:
     for path in files:
         task = json.loads(path.read_text())
         source = task["source"]
+        units = build_units(source)
         tiles = []
         for name, w, h in CATALOGUE:
             t0 = time.time()
             out = resize(source, {"width": w, "height": h})
             dt = time.time() - t0
-            problems = check_design(source, out)
+            floors = design_issues(units, out) if w * h >= 60_000 else tiny_issues(units, out)
+            problems = check_design(source, out) + [f"floor: {m}" for m in floors]
             png = OUT / f"{path.stem}__{w}x{h}.png"
             render_design_to_png(out, "brand_kit/assets", str(png))
             (OUT / f"{path.stem}__{w}x{h}.json").write_text(json.dumps(out, indent=1))

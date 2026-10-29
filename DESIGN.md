@@ -174,12 +174,14 @@ engine/
   layout.py      Ctx, sizing, column/row packers, the four families
   validate.py    repair (clamp + de-collide), final element fixes, check_design
   score.py       internal rubric (with a breakdown for debugging)
-  quality.py     brand/readability floors (visible logo, real hero, min text px)
+  quality.py     brand/readability floors, visible-pixel sizing, tiny-canvas contract
+  assets.py      read-only measurement of each asset's visible (non-transparent) bounds
   geometry.py    rotated AABBs, overlap
 tools/
   matrix.py      every input × 14 catalogue formats → output/matrix/*.png sheets
   fuzz.py        synthetic design generator (python -m tools.fuzz 200)
   check.py       pytest-free full check; run it in Docker too (see its docstring)
+  compare.py     source vs output side by side for every format
 tests/
   test_invariants.py   samples × catalogue, identity, determinism, fuzz
 ```
@@ -210,6 +212,26 @@ Behaviours added during implementation that §3 did not spell out:
 - Text measures ~2 % wider on Linux (FreeType rounds glyph advances) than on
   macOS. Scoring runs on Linux, so `tools/check.py` is run in the container as
   well as locally; layouts must not sit on a knife edge between the two.
+- Image floors are measured on *visible* pixels (`assets.py` reads each
+  asset's alpha bounds once; the logo lockup is 60 % transparent padding) and
+  never exceed what the source itself showed at the target's scale, so a
+  designer's deliberately small logo stays small.
+- Priority runs all the way down. When nothing fits, text gives up height
+  least-important-first (to its floor, then to a 4 px hard minimum), pills and
+  images follow, the headline last; in a ribbon, badges, hero and minor images
+  surrender width to a starved headline before the logo or CTA do. A post-pass
+  keeps every text at or below the headline's size.
+- Two-tier contract: canvases of 60 000 px² and up must meet every floor;
+  below that (320×50 with 17 elements) nothing may fall under 4 px and the
+  headline must stay the largest text. `tests/` and `tools/check.py` enforce
+  both tiers.
+- Sparse layouts grow: when a column would leave 40 %+ of its region empty
+  and nothing had to shrink, everything is scaled up (to 1.4×) while it still
+  fits and breaks no floor. A 1080² post on a 1080×1920 story no longer looks
+  like a thumbnail on a wall.
+- Performance: text measurement is memoised, unit boxes are computed inline,
+  collision repair works on boxes computed once per round, and shrinking one
+  unit re-sizes only its own source row. 275 elements: ~4–7 s (was ~60 s).
 
 ## 6. Testing plan
 
@@ -233,7 +255,7 @@ Behaviours added during implementation that §3 did not spell out:
 | 2 | tall + wide families, pill units, gap distribution | Level 2 (1600×400) correct |
 | 3 | ribbon family, priority budgets, dense variants | Level 3 (728×90) legible |
 | 4 | candidates + scorer, catalogue matrix, fuzz | "holds up everywhere" |
-| 5 | README, Docker verification, timing | Submission-ready |
+| 5 | README, Docker verification, timing | Submission-ready (done: README.md, tools/check.py in Docker) |
 
 ## 8. Explicitly out of scope for stage one
 

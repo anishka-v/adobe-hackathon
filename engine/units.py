@@ -12,7 +12,8 @@ import copy
 import math
 from typing import Dict, List, Optional
 
-from .geometry import Box, area, contains_fraction, element_aabb, overlap_area, union
+from .assets import asset_info
+from .geometry import Box, area, contains_fraction, element_aabb, overlap_area, rotated_aabb, union
 from . import textfit
 
 # Higher = more important = shrinks last and is placed first when space is tight.
@@ -62,6 +63,8 @@ class Unit:
         self.min_scale = 0.2   # floor scale for images/pills relative to s_pref
         self.key = tuple(sorted(e["id"] for e in elements))
         self.intentional: set = set()  # keys of units this one may overlap
+        self.asset = None              # AssetInfo for image units (visible-pixel bounds)
+        self.src_canvas = (1.0, 1.0)   # source canvas size, for scale-relative floors
 
     # -- accessors ---------------------------------------------------------
     @property
@@ -74,7 +77,32 @@ class Unit:
 
     @property
     def box(self) -> Box:
-        return union(element_aabb(e) for e in self.elements)
+        # hot path (millions of calls per layout): no generators, no helper calls
+        # for the common single, unrotated element
+        els = self.elements
+        if len(els) == 1:
+            e = els[0]
+            r = e.get("rotation", 0) or 0
+            if not r:
+                return (e["x"], e["y"], e["width"], e["height"])
+            return rotated_aabb(e["x"], e["y"], e["width"], e["height"], r)
+        x0 = y0 = float("inf")
+        x1 = y1 = float("-inf")
+        for e in els:
+            r = e.get("rotation", 0) or 0
+            if r:
+                x, y, w, h = rotated_aabb(e["x"], e["y"], e["width"], e["height"], r)
+            else:
+                x, y, w, h = e["x"], e["y"], e["width"], e["height"]
+            if x < x0:
+                x0 = x
+            if y < y0:
+                y0 = y
+            if x + w > x1:
+                x1 = x + w
+            if y + h > y1:
+                y1 = y + h
+        return (x0, y0, x1 - x0, y1 - y0)
 
     @property
     def text_el(self) -> Optional[dict]:
@@ -133,7 +161,8 @@ class Unit:
             e["width"] *= s
             e["height"] *= s
             if e["type"] == "text":
-                e["font_size"] = max(1, int(math.floor(float(e["font_size"]) * s)))
+                # +1e-6: floor(4.0 * 0.999999…) must be 4, not 3 (hard-minimum guards rely on it)
+                e["font_size"] = max(1, int(math.floor(float(e["font_size"]) * s + 1e-6)))
                 if e.get("letter_spacing"):
                     e["letter_spacing"] = float(e["letter_spacing"]) * s
             elif e["type"] == "shape":
@@ -337,6 +366,13 @@ def build_units(source: dict) -> List[Unit]:
             if ov > 0.02 * min(area(a.src_box), area(b.src_box)):
                 a.intentional.add(b.key)
                 b.intentional.add(a.key)
+
+    # 12. Asset measurements (read-only) so size floors apply to visible pixels.
+    for u in units:
+        u.src_canvas = (cw, ch)
+        img = u.image_el
+        if img is not None:
+            u.asset = asset_info(img.get("asset_id"))
     return units
 
 

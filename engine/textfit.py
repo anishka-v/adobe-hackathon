@@ -48,21 +48,33 @@ def _typeface(family: str, weight: str, style: str):
     return skia.Typeface.MakeFromData(ttf)
 
 
+def _text_key(el: dict, font_size: int, content: str) -> tuple:
+    weight, style = _style(el)
+    return (content, el.get("font_family", ""), weight, style, int(font_size),
+            float(el.get("letter_spacing", 0) or 0))
+
+
+@lru_cache(maxsize=200_000)
+def _char_widths_cached(key: tuple) -> Tuple[float, ...]:
+    content, family, weight, style, font_size, spacing = key
+    if _font_manager is None or skia is None:
+        avg = 0.55 if "Serif" not in family else 0.52
+        return tuple(font_size * avg + spacing for _ in content)
+    try:
+        font = skia.Font(_typeface(family, weight, style), font_size)
+        glyphs = font.textToGlyphs(content)
+        return tuple(w + spacing for w in font.getWidths(glyphs))
+    except Exception:
+        return tuple(font_size * 0.55 + spacing for _ in content)
+
+
 def char_widths(el: dict, font_size: int, content: str) -> List[float]:
-    """Per-character advance widths at `font_size`, letter spacing included."""
-    spacing = float(el.get("letter_spacing", 0) or 0)
+    """Per-character advance widths at `font_size`, letter spacing included.
+    Memoised: the layout re-measures the same strings hundreds of times while
+    it shrinks and re-packs."""
     if not content:
         return []
-    if _font_manager is None or skia is None:
-        avg = 0.55 if "Serif" not in (el.get("font_family") or "") else 0.52
-        return [font_size * avg + spacing for _ in content]
-    weight, style = _style(el)
-    try:
-        font = skia.Font(_typeface(el.get("font_family", ""), weight, style), int(font_size))
-        glyphs = font.textToGlyphs(content)
-        return [w + spacing for w in font.getWidths(glyphs)]
-    except Exception:
-        return [font_size * 0.55 + spacing for _ in content]
+    return list(_char_widths_cached(_text_key(el, max(1, int(font_size)), content)))
 
 
 def _wrap(content: str, widths: List[float], max_width: float) -> str:
@@ -103,7 +115,13 @@ def measure(el: dict, font_size: int, width: float) -> TextMetrics:
     content = str(el.get("content", ""))
     lh = float(el.get("line_height", _DEFAULT_LINE_HEIGHT) or _DEFAULT_LINE_HEIGHT)
     font_size = max(1, int(font_size))
-    widths = char_widths(el, font_size, content)
+    return _measure_cached(_text_key(el, font_size, content), lh, round(float(width), 2))
+
+
+@lru_cache(maxsize=200_000)
+def _measure_cached(key: tuple, lh: float, width: float) -> TextMetrics:
+    content, font_size = key[0], key[4]
+    widths = list(_char_widths_cached(key))
     wrapped = _wrap(content, widths, width)
     line_widths, cur = [], 0.0
     word_widths, word = [], 0.0
