@@ -145,4 +145,5 @@ engine/
   main.py       starter orchestrator (unchanged)
 ```
 
-The input/output format is specified in `chameleon_design_schema_v0.9.json`.
+The starter kit's rules and FAQ are in [RULES.md](RULES.md) and
+[FAQ.md](FAQ.md); the schema is `chameleon_design_schema_v0.9.json`.
