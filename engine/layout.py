@@ -510,7 +510,7 @@ def _fit_within_floors(u: Unit, max_w: float, max_h: float, ctx: Ctx) -> None:
 
 
 # How much more slowly the logo gives up width than other fixed columns in a ribbon
-# (1.0 = same rate; smaller = protected). Tuned on the catalogue, see tools/matrix.py.
+# (1.0 = same rate; smaller = protected). Tuned on real banner formats (728x90, 970x90, 1584x396).
 RIBBON_LOGO_SHRINK_EXP = 0.8
 
 

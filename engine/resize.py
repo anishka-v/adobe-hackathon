@@ -1,7 +1,7 @@
 """
 CHAMELEON engine — `resize()` is the entry point `engine/main.py` calls.
 
-Approach (see DESIGN.md):
+Approach (see README.md):
   1. parse the source into *units* (elements that travel together) and infer
      each unit's role from geometry alone (units.py);
   2. pick layout families from how much the aspect ratio changes and build
